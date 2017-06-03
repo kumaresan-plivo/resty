@@ -1,6 +1,7 @@
 local redis = require "resty.redis"
 local cjson = require "cjson"
 local cache = redis:new()
+local proxyredis = redis:new()
 
 local ok, err = cache:connect("ratelimit-test.kn51nf.ng.0001.usw1.cache.amazonaws.com", 6379)
 if not ok then
@@ -8,12 +9,9 @@ if not ok then
     ngx.exit(ngx.HTTP_SERVICE_UNAVAILABLE)
 end
 
-local headers = ngx.req.get_headers()
-local auth = headers.Authorization
-
-local function get_auth_credentials(header)
-	local credentials_decoded = ngx.decode_base64(header:match(".%w+%s(%w+.)"))
-	return credentials_decoded:match("(.*):(.*)")
+local ok, err = proxyredis:connect("ratelimit-test.kn51nf.ng.0001.usw1.cache.amazonaws.com", 6379)
+if not ok then
+    ngx.log(ngx.ERR, 'RL:: Cannot connect to proxyredis from ratelimiting. Continuing...', err)
 end
 
 
@@ -65,14 +63,43 @@ local function send_deny_response()
     ngx.say(cjson.encode({ error = "rate limit exceeded" }))  
 end
 
+local function map_sub_to_parent_authid(sub_auth_id)
+    if string.sub(sub_auth_id, 1, 2) == "SA" then
+        local auth_cache_key = string.format("auth:%s", sub_auth_id)
+        local parent_auth_id = proxyredis:hget(auth_cache_key, "parent_sid")
+        if not parent_auth_id or type(parent_auth_id) ~= "string" then
+            ngx.log(ngx.ERR, "RL:: Failed to fetch parent account Id for subaccount auth Id: ", sub_auth_id)
+            return sub_auth_id
+        end
+
+        return parent_auth_id
+    end
+
+    return sub_auth_id
+end
+
 local function get_lookup_key(auth_id)
     local uri = ngx.var.request_uri
     local method = ngx.req.get_method()
+    auth_id = map_sub_to_parent_authid(auth_id)
+    -- check for special params in url
+    if uri:find("([Call]+)([status=]+)") then
+        -- look at hardcoded keys
+        return string.format("rl:%s:%s:/callstatus/", auth_id, method)
+    end
     -- discard url after 4 verbs, we can't possibly match all patterns
     local v,v2,orig_auth_id,v3 = uri:match("([^/]+)/([^/]+)/([^/]+)/([^/]+)")
     -- replace orig auth id for lookup key
     local lookup_key = string.format("rl:%s:%s:/%s/%s/%s/%s/",auth_id,method,v,v2, auth_id,v3)
     return lookup_key
+end
+
+local headers = ngx.req.get_headers()
+local auth = headers.Authorization
+
+local function get_auth_credentials(header)
+	local credentials_decoded = ngx.decode_base64(header:match(".%w+%s(%w+.)"))
+	return credentials_decoded:match("(.*):(.*)")
 end
 
 if auth then
